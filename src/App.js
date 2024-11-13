@@ -28,6 +28,7 @@ const World = () => {
         size={0.3}
         disturbIntensity={0.2}
         shape="circle"
+        colors={["#e3b300", "#fc7a42"]}
       >
       
      

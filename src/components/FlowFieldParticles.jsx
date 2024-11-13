@@ -18,17 +18,20 @@ const GpgpuFragmentShader = /*glsl*/ `
     vec2 uv = gl_FragCoord.xy / resolution.xy;
     vec4 particle =  texture2D(uParticles, uv);
     vec4 baseParticle = texture2D(uBaseParticlesTexture, uv);
+
     float uRepelStrength = uMouseDelta;
     uRepelStrength = mix(uRepelStrength, 0.0, uMouseDelta);
-    vec2 particlePos = particle.xy;
-    vec2 mousePos = uMouse.xy;
+    vec3 particlePos = particle.xyz;
+    vec3 mousePos = uMouse.xyz;
+    vec3 dir = normalize(particlePos - mousePos);
     float dist = distance(mousePos, particlePos);
-    vec2 dir = normalize(particlePos - mousePos);
     float repulsionForce = uRepelStrength / (dist * (dist + 1.0));
-    vec2 repulsion = dir * repulsionForce;
+    vec3 repulsion = dir * repulsionForce;
+
     if(uInteractive){
-      particle.xy += repulsion * uRepelStrength;
+      particle.xyz += repulsion * uRepelStrength;
     }
+
     if (particle.a >= 1.0) {
         particle.a = mod(particle.a, 1.0); 
         particle.xyz = baseParticle.xyz;
@@ -51,6 +54,7 @@ const GpgpuFragmentShader = /*glsl*/ `
     }
     gl_FragColor.rgba = particle;
 }
+
 `;
 const ParticlesVertexShader = /*glsl*/ `
   uniform float uSize;
@@ -68,20 +72,25 @@ const ParticlesVertexShader = /*glsl*/ `
   varying float vParticlesAlpha;
   varying vec2 vMeshUv;
   varying vec3 vNormal;
+  varying vec3 vParticleTexture;
+
   void main() {
     vec4 particle = texture2D(uParticlesTexture, aParticlesUv);
     vec4 modelPosition = modelMatrix * vec4(particle.xyz, 1.0);
     vec4 viewPosition = viewMatrix * modelPosition;
     vec4 projectedPosition = projectionMatrix * viewPosition;
     gl_Position = projectedPosition;
+
     /* Point Size */
     float lifeSize = 1.0-smoothstep(0.5, 1.0, particle.a);
     gl_PointSize = aParticlesSize * lifeSize * uSize * uResolution.y;
     gl_PointSize *= (1.0 / - viewPosition.z);
+
     /* Variables to the fragment Shader */
     vColor = uColors;
     vPosition = position.xyz;
     vParticlesAlpha = particle.a;
+    vParticleTexture = particle.xyz;
     vMeshUv = aMeshUv;
     vNormal = aNormal;
   }
@@ -100,6 +109,8 @@ const ParticlesFragmentShader = /*glsl*/ `
   varying vec2 vMeshUv;
   varying vec3 vPosition;
   varying vec3 vNormal;
+  varying vec3 vParticleTexture;
+
   void main() {
       vec2 uv = gl_PointCoord.xy;
       vec3 diffuseMap = texture2D(uMeshMap, vMeshUv).rgb;
@@ -118,6 +129,7 @@ const ParticlesFragmentShader = /*glsl*/ `
           circle = smoothstep(0.5, 0.0, circle);
       }
       if(circle < 0.01) discard;
+
       /* Lighting */
       float light = 1.0;
       float lightIntensity = 1.0;
@@ -134,9 +146,11 @@ const ParticlesFragmentShader = /*glsl*/ `
         specular *= 0.5;
         lightColor = uLightSourceColor;
       }
+
       float circleSphere =  length(uv - vec2(0.5));
       circleSphere = smoothstep(1.0, 0.0, circleSphere);
       circleSphere = pow(circleSphere, 2.0);
+
       vec3 color = vec3(1.0);
       if (uHasColors) {
         float colorType = (uShape == 3) ? circleSphere  : smoothstep(0.0, 1.0, 1.0-vNormal.y);
@@ -146,6 +160,7 @@ const ParticlesFragmentShader = /*glsl*/ `
       }
       color *= lightColor;
       color *= (light * lightIntensity) + specular;
+      //color = vParticleTexture;
  
       gl_FragColor.rgba = vec4(color, 1.0);
   }
@@ -222,9 +237,9 @@ const FlowFieldParticles = ({
   const particlesMaterialRef = useRef(null);
   const helperRef = useRef(null);
   const mouseRef = useRef(new Vector3());
-  const mouseDeltaRef = useRef(new Vector3());
+  const meshWorldPosition = useMemo(() => new Vector3(), []);
+  const previousTime = useRef(0);
   const gl = useThree(state => state.gl);
-
   const modelMesh = useMemo(() => {
     if (!meshRef.current) return;
     return meshRef.current;
@@ -306,9 +321,9 @@ const FlowFieldParticles = ({
   }, [modelGeometry]);
   const handlePointerMove = useCallback(e => {
     const { point, object } = e;
-    const { position } = object;
+    const objectWorldPosition = object.getWorldPosition(meshWorldPosition);
     if (mouseRef.current) {
-      const { x, y, z } = point.sub(position);
+      const { x, y, z } = point.sub(objectWorldPosition);
       mouseRef.current.set(x, y, z);
     }
   }, []);
@@ -325,7 +340,15 @@ const FlowFieldParticles = ({
     }
     if (particlesMaterialRef.current) {
       particlesMaterialRef.current.uniforms.uHasColors.value = true;
-      const colorsArray = colors?.map(color => new Color(color)) || [modelGeometry.material.color, modelGeometry.material.color];
+      const colorsArray = colors?.map(color => {
+        if (typeof color === "string") {
+          return new Color(color);
+        } else {
+          if (typeof color === "object" && "isColor" in color) {
+            return color;
+          }
+        }
+      }) || [modelGeometry.material.color, modelGeometry.material.color];
       particlesMaterialRef.current.uniforms.uColors.value = colorsArray;
       particlesMaterialRef.current.uniforms.uSize.value = size;
 
@@ -361,20 +384,21 @@ const FlowFieldParticles = ({
   let lastMousePosX = 0;
   let mouseDeltaValue = 0;
 
-  useFrame(({ clock }, delta) => {
+  useFrame(({ clock, camera }) => {
     const elapsedTime = clock.getElapsedTime();
+    const deltaTime = Math.min(elapsedTime - previousTime.current, 1 / 60);
+    previousTime.current = elapsedTime;
     mouseDeltaValue = MathUtils.lerp(mouseDeltaValue, Math.abs(lastMousePosX - mouseRef.current.x), 0.1);
     if (particlesRef.current) {
       particlesRef.current.position.copy(modelMesh.position);
-      modelMesh.position.copy(modelMesh.position);
+      //modelMesh.position.copy(modelMesh.position);
     }
     if (particlesMaterialRef.current) {
-      mouseDeltaRef.current.sub(mouseRef.current);
-      mouseDeltaRef.current.copy(mouseRef.current);
       /** Gpgpu computation */
       gpgpu.ref.compute();
       gpgpu.particlesVariable.material.uniforms.uTime.value = elapsedTime;
-      gpgpu.particlesVariable.material.uniforms.uDeltaTime.value = delta;
+      gpgpu.particlesVariable.material.uniforms.uDeltaTime.value = deltaTime;
+
       gpgpu.particlesVariable.material.uniforms.uMouse.value.copy(mouseRef.current);
       gpgpu.particlesVariable.material.uniforms.uMouseDelta.value = mouseDeltaValue;
 
